@@ -14,37 +14,26 @@
 
 use actix_web::{http, HttpResponse};
 use ahash::AHashMap;
-use bytes::{BufMut, BytesMut};
 use chrono::{Duration, TimeZone, Utc};
 use datafusion::arrow::datatypes::Schema;
 use promql_parser::label::MatchOp;
 use promql_parser::parser;
 use prost::Message;
-use rustc_hash::FxHashSet;
-use std::{collections::HashMap, io, time::Instant};
+use std::time::Instant;
+use std::{fs::OpenOptions, io::Error};
+use tracing::info_span;
 
-use crate::{
-    common::{json, time::parse_i64_to_timestamp_micros},
-    infra::{
-        cache::stats,
-        cluster,
-        config::{CONFIG, METRIC_CLUSTER_LEADER, METRIC_CLUSTER_MAP},
-        errors::{Error, Result},
-        file_lock, metrics,
-    },
-    meta::{
-        self,
-        alert::{Alert, Trigger},
-        prom::{self, HASH_LABEL, METADATA_LABEL, NAME_LABEL, VALUE_LABEL},
-        StreamType,
-    },
-    service::{
-        db,
-        ingestion::chk_schema_by_record,
-        schema::{set_schema_metadata, stream_schema_exists},
-        search as search_service,
-    },
-};
+use crate::common::{json, time::parse_i64_to_timestamp_micros};
+use crate::infra::cluster;
+use crate::infra::config::{CONFIG, METRIC_CLUSTER_LEADER, METRIC_CLUSTER_MAP};
+use crate::meta::alert::{Alert, Trigger};
+use crate::meta::prom::*;
+use crate::meta::usage::{RequestStats, UsageEvent};
+use crate::meta::{self, StreamType};
+use crate::service::db;
+use crate::service::ingestion::write_file;
+use crate::service::schema::{add_stream_schema, set_schema_metadata, stream_schema_exists};
+use crate::service::usage::report_ingest_stats;
 
 pub(crate) mod prometheus {
     include!(concat!(env!("OUT_DIR"), "/prometheus.rs"));
@@ -73,7 +62,7 @@ pub async fn remote_write(
     let mut has_entry = false;
     let mut accept_record = false;
     let mut cluster_name: String = String::new();
-    let mut metric_data_map: AHashMap<String, HashMap<String, Vec<String>>> = AHashMap::new();
+    let mut metric_data_map: AHashMap<String, AHashMap<String, Vec<String>>> = AHashMap::new();
     let mut metric_schema_map: AHashMap<String, Schema> = AHashMap::new();
     let mut stream_alerts_map: AHashMap<String, Vec<Alert>> = AHashMap::new();
     let mut stream_trigger_map: AHashMap<String, Trigger> = AHashMap::new();
@@ -317,62 +306,32 @@ pub async fn remote_write(
         }
     }
 
+    let mut final_req_stats = RequestStats::default();
     for (metric_name, metric_data) in metric_data_map {
         // write to file
-        let mut write_buf = BytesMut::new();
-        for (key, entry) in metric_data {
-            if entry.is_empty() {
-                continue;
-            }
+        let mut metric_file_name = "".to_string();
 
-            // check if we are allowed to ingest
-            if db::compact::delete::is_deleting_stream(
-                org_id,
-                &metric_name,
-                StreamType::Metrics,
-                None,
-            ) {
-                return Ok(HttpResponse::InternalServerError().json(
-                    meta::http::HttpResponse::error(
-                        http::StatusCode::INTERNAL_SERVER_ERROR.into(),
-                        format!("stream [{metric_name}] is being deleted"),
-                    ),
-                ));
-            }
-
-            write_buf.clear();
-            for row in &entry {
-                write_buf.put(row.as_bytes());
-                write_buf.put("\n".as_bytes());
-            }
-            let file = file_lock::get_or_create(
-                *thread_id.as_ref(),
-                org_id,
-                &metric_name,
-                StreamType::Metrics,
-                &key,
-                CONFIG.common.wal_memory_mode_enabled,
+        // check if we are allowed to ingest
+        if db::compact::delete::is_deleting_stream(org_id, &metric_name, StreamType::Metrics, None)
+        {
+            return Ok(
+                HttpResponse::InternalServerError().json(meta::http::HttpResponse::error(
+                    http::StatusCode::INTERNAL_SERVER_ERROR.into(),
+                    format!("stream [{metric_name}] is being deleted"),
+                )),
             );
-            file.write(write_buf.as_ref());
-
-            // metrics
-            metrics::INGEST_RECORDS
-                .with_label_values(&[
-                    org_id,
-                    &metric_name,
-                    StreamType::Metrics.to_string().as_str(),
-                ])
-                .inc_by(entry.len() as u64);
-            metrics::INGEST_BYTES
-                .with_label_values(&[
-                    org_id,
-                    &metric_name,
-                    StreamType::Metrics.to_string().as_str(),
-                ])
-                .inc_by(write_buf.len() as u64);
         }
 
-        let _schema_exists = stream_schema_exists(
+        final_req_stats = write_file(
+            metric_data.clone(),
+            thread_id.clone(),
+            org_id,
+            &metric_name,
+            &mut metric_file_name,
+            StreamType::Metrics,
+        );
+
+        let schema_exists = stream_schema_exists(
             org_id,
             &metric_name,
             StreamType::Metrics,
@@ -404,24 +363,15 @@ pub async fn remote_write(
     }
 
     let time = start.elapsed().as_secs_f64();
-    metrics::HTTP_RESPONSE_TIME
-        .with_label_values(&[
-            "/prometheus/api/v1/write",
-            "200",
-            org_id,
-            "",
-            &StreamType::Metrics.to_string(),
-        ])
-        .observe(time);
-    metrics::HTTP_INCOMING_REQUESTS
-        .with_label_values(&[
-            "/prometheus/api/v1/write",
-            "200",
-            org_id,
-            "",
-            &StreamType::Metrics.to_string(),
-        ])
-        .inc();
+    final_req_stats.response_time += time;
+    //metric + data usage
+    report_ingest_stats(
+        &final_req_stats,
+        org_id,
+        StreamType::Metrics,
+        UsageEvent::Metrics,
+    )
+    .await;
 
     Ok(HttpResponse::Ok().into())
 }
