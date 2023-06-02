@@ -14,26 +14,39 @@
 
 use actix_web::{http, HttpResponse};
 use ahash::AHashMap;
+use bytes::{BufMut, BytesMut};
 use chrono::{Duration, TimeZone, Utc};
 use datafusion::arrow::datatypes::Schema;
 use promql_parser::label::MatchOp;
 use promql_parser::parser;
 use prost::Message;
-use std::time::Instant;
-use std::{fs::OpenOptions, io::Error};
-use tracing::info_span;
+use rustc_hash::FxHashSet;
+use std::{collections::HashMap, io, time::Instant};
 
-use crate::common::{json, time::parse_i64_to_timestamp_micros};
-use crate::infra::cluster;
-use crate::infra::config::{CONFIG, METRIC_CLUSTER_LEADER, METRIC_CLUSTER_MAP};
-use crate::meta::alert::{Alert, Trigger};
-use crate::meta::prom::*;
-use crate::meta::usage::{RequestStats, UsageEvent};
-use crate::meta::{self, StreamType};
-use crate::service::db;
-use crate::service::ingestion::write_file;
-use crate::service::schema::{add_stream_schema, set_schema_metadata, stream_schema_exists};
-use crate::service::usage::report_ingest_stats;
+use crate::{
+    common::{json, time::parse_i64_to_timestamp_micros},
+    infra::{
+        cache::stats,
+        cluster,
+        config::{CONFIG, METRIC_CLUSTER_LEADER, METRIC_CLUSTER_MAP},
+        errors::{Error, Result},
+        file_lock, metrics,
+    },
+    meta::{
+        self,
+        alert::{Alert, Trigger},
+        prom::{self, HASH_LABEL, METADATA_LABEL, NAME_LABEL, VALUE_LABEL},
+        usage::{RequestStats, UsageEvent},
+        StreamType,
+    },
+    service::{
+        db,
+        ingestion::{chk_schema_by_record, write_file},
+        schema::{set_schema_metadata, stream_schema_exists},
+        search as search_service,
+        usage::report_ingest_stats,
+    },
+};
 
 pub(crate) mod prometheus {
     include!(concat!(env!("OUT_DIR"), "/prometheus.rs"));
